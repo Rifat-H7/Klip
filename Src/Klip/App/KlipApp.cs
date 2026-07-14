@@ -78,7 +78,7 @@ static class KlipApp
           Klip receive [--port 45245] [--out <folder>] [--overwrite] [--clipboard]
           Klip send <file> --host <address> [--port 45245] [--chunk-size <bytes>]
           Klip send --clipboard --host <address> [--port 45245]
-          Klip server [--port 45245]
+          Klip server [--port 45245] [--content-port 45246]
           Klip client --host <address> [--port 45245] [--content-port 45246]
 
         Examples:
@@ -86,7 +86,7 @@ static class KlipApp
           Klip receive --clipboard --out received
           Klip send .\photo.jpg --host 192.168.1.20 --port 45245
           Klip send --clipboard --host 192.168.1.20
-          Klip server
+          Klip server --content-port 45246
           Klip client --host 192.168.1.20
 
         Protocol:

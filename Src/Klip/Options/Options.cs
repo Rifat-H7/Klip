@@ -123,11 +123,12 @@ sealed record ReceiveOptions(int Port, string OutputFolder, bool Overwrite, bool
     }
 }
 
-sealed record SyncServerOptions(int Port)
+sealed record SyncServerOptions(int Port, int ContentPort)
 {
     public static SyncServerOptions Parse(string[] args)
     {
         var port = Defaults.Port;
+        var contentPort = Defaults.Port + 1;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -136,21 +137,24 @@ sealed record SyncServerOptions(int Port)
                 case "--port" when i + 1 < args.Length:
                     port = ParsePort(args[++i]);
                     break;
+                case "--content-port" when i + 1 < args.Length:
+                    contentPort = ParsePort(args[++i], "content port");
+                    break;
                 case "-h" or "--help":
-                    throw new KlipException("Usage: Klip server [--port 45245]");
+                    throw new KlipException("Usage: Klip server [--port 45245] [--content-port 45246]");
                 default:
                     throw new KlipException($"Unknown server option: {args[i]}");
             }
         }
 
-        return new SyncServerOptions(port);
+        return new SyncServerOptions(port, contentPort);
     }
 
-    private static int ParsePort(string value)
+    private static int ParsePort(string value, string name = "port")
     {
         if (!int.TryParse(value, out var port) || port is < 1 or > 65535)
         {
-            throw new KlipException("Port must be between 1 and 65535.");
+            throw new KlipException($"{name} must be between 1 and 65535.");
         }
 
         return port;

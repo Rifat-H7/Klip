@@ -2,6 +2,8 @@
 {
     public string Key => $"{Kind}:{Fingerprint}";
 
+    public static string CreateTextKey(string text) => $"{ClipboardSnapshotKind.Text}:{text}";
+
     public static ClipboardSnapshot? Read()
     {
         if (!OperatingSystem.IsWindows())

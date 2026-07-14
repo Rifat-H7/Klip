@@ -7,8 +7,8 @@
             TryClear();
             Console.WriteLine("Klip");
             Console.WriteLine("====");
-            Console.WriteLine("1. Server - receive synced clipboard and paste here");
-            Console.WriteLine("2. Client - watch this clipboard and sync to server");
+            Console.WriteLine("1. Server - listen for bidirectional clipboard sync");
+            Console.WriteLine("2. Client - connect for bidirectional clipboard sync");
             Console.WriteLine("3. Send clipboard once");
             Console.WriteLine("4. Send file once");
             Console.WriteLine("5. Receive file once");
@@ -57,14 +57,15 @@
     private static string[] BuildServerArgs()
     {
         var port = Prompt("Server port", Defaults.Port.ToString());
-        return ["server", "--port", port];
+        var contentPort = Prompt("Server content port", (Defaults.Port + 1).ToString());
+        return ["server", "--port", port, "--content-port", contentPort];
     }
 
     private static string[] BuildClientArgs()
     {
         var host = PromptRequired("Server IP or host");
         var port = Prompt("Server port", Defaults.Port.ToString());
-        var contentPort = Prompt("Client content port", (Defaults.Port + 1).ToString());
+        var contentPort = Prompt("Local content port", (Defaults.Port + 1).ToString());
         return ["client", "--host", host, "--port", port, "--content-port", contentPort];
     }
 
