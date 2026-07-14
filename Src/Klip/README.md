@@ -97,13 +97,13 @@ This lets compatible paste targets receive the incoming file from the clipboard 
 
 ## Always-on clipboard sync
 
-Start the server on the machine where you want to paste:
+Start the server on one machine:
 
 ```powershell
-dotnet run -- server --port 45245
+dotnet run -- server --port 45245 --content-port 45246
 ```
 
-Start the client on the machine where you copy:
+Start the client on the other machine:
 
 ```powershell
 dotnet run -- client --host 192.168.1.20 --port 45245 --content-port 45246
@@ -111,8 +111,8 @@ dotnet run -- client --host 192.168.1.20 --port 45245 --content-port 45246
 
 After startup:
 
-- copied text is sent to the server clipboard immediately
-- copied files/folders are sent as virtual clipboard metadata only
-- real file bytes are transferred only when the server-side user pastes
+- copied text syncs in both directions
+- copied files/folders sync as virtual clipboard metadata in both directions
+- real file bytes are transferred only when the other side pastes
 
-For lazy file/folder paste, the server must be able to connect back to the client on `--content-port`.
+For lazy file/folder paste, each machine must be able to connect to the other machine's `--content-port`.
