@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
+// Klip entry point and TCP/clipboard synchronization implementation.
 return await KlipApp.RunAsync(args);
 
 static class Defaults
@@ -619,8 +620,8 @@ static class SyncServerCommand
                     try
                     {
                         var provider = new RemoteVirtualFileProvider(remoteAddress, message.TransferPort.Value, message.TransferId);
-                        VirtualClipboard.SetFiles(message.Items, provider.ReadFileBytes);
-                        Console.WriteLine($"Clipboard virtual files updated ({message.Items.Count} item(s), live IDataObject, copy drop effect). Bytes will transfer on paste.");
+                    VirtualClipboard.SetFiles(message.Items, provider.OpenRead);
+                        Console.WriteLine($"Clipboard virtual files updated ({message.Items.Count} item(s), live IDataObject, IStream contents). Bytes will transfer on paste.");
                     }
                     catch (KlipException ex)
                     {
@@ -792,24 +793,67 @@ sealed class RemoteVirtualFileProvider
         _transferId = transferId;
     }
 
-    public byte[] ReadFileBytes(int index)
+    public Stream OpenRead(int index)
     {
-        using var client = new TcpClient();
-        client.Connect(_host, _port);
-        client.NoDelay = true;
+        return new RemoteFileContentStream(_host, _port, _transferId, index);
+    }
+}
 
-        using var stream = client.GetStream();
-        SyncProtocol.WriteTransferRequestAsync(stream, new TransferRequest(_transferId, index), CancellationToken.None)
-            .GetAwaiter()
-            .GetResult();
+sealed class RemoteFileContentStream : Stream
+{
+    private readonly string _host;
+    private readonly int _port;
+    private readonly string _transferId;
+    private readonly int _index;
+    private TcpClient? _client;
+    private NetworkStream? _network;
+    private ArraySegment<byte> _currentChunk = ArraySegment<byte>.Empty;
+    private bool _completed;
 
-        using var output = new MemoryStream();
-        while (true)
+    public RemoteFileContentStream(string host, int port, string transferId, int index)
+    {
+        _host = host;
+        _port = port;
+        _transferId = transferId;
+        _index = index;
+    }
+
+    public override bool CanRead => true;
+
+    public override bool CanSeek => false;
+
+    public override bool CanWrite => false;
+
+    public override long Length => throw new NotSupportedException();
+
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        if (offset < 0 || count < 0 || offset + count > buffer.Length)
         {
-            var frame = KlipProtocol.ReadFrameAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        }
+
+        if (count == 0 || _completed)
+        {
+            return 0;
+        }
+
+        EnsureConnected();
+
+        while (_currentChunk.Count == 0)
+        {
+            var frame = KlipProtocol.ReadFrameAsync(_network!, CancellationToken.None).GetAwaiter().GetResult();
             if (frame.Type == FrameType.End)
             {
-                break;
+                _completed = true;
+                return 0;
             }
 
             if (frame.Type != FrameType.Data)
@@ -817,10 +861,53 @@ sealed class RemoteVirtualFileProvider
                 throw new KlipException($"Unexpected transfer frame: {frame.Type}");
             }
 
-            output.Write(frame.Payload.Array!, frame.Payload.Offset, frame.Payload.Count);
+            _currentChunk = frame.Payload;
         }
 
-        return output.ToArray();
+        var toCopy = Math.Min(count, _currentChunk.Count);
+        Buffer.BlockCopy(_currentChunk.Array!, _currentChunk.Offset, buffer, offset, toCopy);
+        _currentChunk = new ArraySegment<byte>(
+            _currentChunk.Array!,
+            _currentChunk.Offset + toCopy,
+            _currentChunk.Count - toCopy);
+        return toCopy;
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _network?.Dispose();
+            _client?.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+
+    private void EnsureConnected()
+    {
+        if (_client is not null)
+        {
+            return;
+        }
+
+        _client = new TcpClient();
+        _client.Connect(_host, _port);
+        _client.NoDelay = true;
+        _network = _client.GetStream();
+        SyncProtocol.WriteTransferRequestAsync(_network, new TransferRequest(_transferId, _index), CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
     }
 }
 
@@ -1298,11 +1385,11 @@ static class VirtualClipboard
                 throw new KlipException("Invalid clipboard file index.");
             }
 
-            return File.ReadAllBytes(path);
+            return File.OpenRead(path);
         });
     }
 
-    public static void SetFiles(IReadOnlyList<VirtualFileItem> items, Func<int, byte[]> readFileBytes)
+    public static void SetFiles(IReadOnlyList<VirtualFileItem> items, Func<int, Stream> openRead)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -1311,7 +1398,7 @@ static class VirtualClipboard
 
         Worker.Value.Invoke(() =>
         {
-            var dataObject = new VirtualFileDataObject(items, readFileBytes);
+            var dataObject = new VirtualFileDataObject(items, openRead);
             var setResult = OleSetClipboard(dataObject);
             if (setResult < 0)
             {
@@ -1433,12 +1520,12 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
     private static readonly short FileContentsFormat = unchecked((short)RegisterClipboardFormat("FileContents"));
     private static readonly short PreferredDropEffectFormat = unchecked((short)RegisterClipboardFormat("Preferred DropEffect"));
     private readonly IReadOnlyList<VirtualFileItem> _items;
-    private readonly Func<int, byte[]> _readFileBytes;
+    private readonly Func<int, Stream> _openRead;
 
-    public VirtualFileDataObject(IReadOnlyList<VirtualFileItem> items, Func<int, byte[]> readFileBytes)
+    public VirtualFileDataObject(IReadOnlyList<VirtualFileItem> items, Func<int, Stream> openRead)
     {
         _items = items.Count > 0 ? items : throw new KlipException("Virtual clipboard needs at least one file item.");
-        _readFileBytes = readFileBytes;
+        _openRead = openRead;
     }
 
     public void GetData(ref System.Runtime.InteropServices.ComTypes.FORMATETC format, out System.Runtime.InteropServices.ComTypes.STGMEDIUM medium)
@@ -1457,7 +1544,7 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
 
         if (format.cfFormat == FileContentsFormat)
         {
-            medium = CreateHGlobalMedium(_readFileBytes(format.lindex < 0 ? 0 : format.lindex));
+            medium = CreateStreamMedium(format.lindex < 0 ? 0 : format.lindex);
             return;
         }
 
@@ -1481,24 +1568,19 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
             return DV_E_FORMATETC;
         }
 
-        if ((format.tymed & System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL) == 0)
-        {
-            return DV_E_TYMED;
-        }
-
         if (format.cfFormat == FileGroupDescriptorFormat)
         {
-            return SOk;
+            return HasTymed(format, System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL) ? SOk : DV_E_TYMED;
         }
 
         if (format.cfFormat == PreferredDropEffectFormat)
         {
-            return SOk;
+            return HasTymed(format, System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL) ? SOk : DV_E_TYMED;
         }
 
         if (format.cfFormat == FileContentsFormat && (format.lindex == -1 || (format.lindex >= 0 && format.lindex < _items.Count)))
         {
-            return SOk;
+            return HasTymed(format, System.Runtime.InteropServices.ComTypes.TYMED.TYMED_ISTREAM) ? SOk : DV_E_TYMED;
         }
 
         return DV_E_FORMATETC;
@@ -1526,7 +1608,7 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
             CreateFormatEtc(FileGroupDescriptorFormat, -1),
             CreateFormatEtc(PreferredDropEffectFormat, -1)
         };
-        formats.AddRange(Enumerable.Range(0, _items.Count).Select(index => CreateFormatEtc(FileContentsFormat, index)));
+        formats.AddRange(Enumerable.Range(0, _items.Count).Select(index => CreateStreamFormatEtc(FileContentsFormat, index)));
         return new FormatEtcEnumerator(formats.ToArray());
     }
 
@@ -1553,6 +1635,19 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
             lindex = index,
             tymed = System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL
         };
+
+    private static System.Runtime.InteropServices.ComTypes.FORMATETC CreateStreamFormatEtc(short format, int index) =>
+        new()
+        {
+            cfFormat = format,
+            ptd = IntPtr.Zero,
+            dwAspect = System.Runtime.InteropServices.ComTypes.DVASPECT.DVASPECT_CONTENT,
+            lindex = index,
+            tymed = System.Runtime.InteropServices.ComTypes.TYMED.TYMED_ISTREAM
+        };
+
+    private static bool HasTymed(System.Runtime.InteropServices.ComTypes.FORMATETC format, System.Runtime.InteropServices.ComTypes.TYMED tymed) =>
+        (format.tymed & tymed) != 0;
 
     private static System.Runtime.InteropServices.ComTypes.STGMEDIUM CreateHGlobalMedium(byte[] bytes)
     {
@@ -1582,6 +1677,20 @@ sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDa
         {
             tymed = System.Runtime.InteropServices.ComTypes.TYMED.TYMED_HGLOBAL,
             unionmember = handle,
+            pUnkForRelease = null
+        };
+    }
+
+    private System.Runtime.InteropServices.ComTypes.STGMEDIUM CreateStreamMedium(int index)
+    {
+        var stream = new ComReadOnlyStream(_openRead(index), _items[index].Length);
+#pragma warning disable CA1416
+        var streamPointer = Marshal.GetComInterfaceForObject(stream, typeof(System.Runtime.InteropServices.ComTypes.IStream));
+#pragma warning restore CA1416
+        return new System.Runtime.InteropServices.ComTypes.STGMEDIUM
+        {
+            tymed = System.Runtime.InteropServices.ComTypes.TYMED.TYMED_ISTREAM,
+            unionmember = streamPointer,
             pUnkForRelease = null
         };
     }
@@ -1685,6 +1794,124 @@ sealed class FormatEtcEnumerator : System.Runtime.InteropServices.ComTypes.IEnum
     public void Clone(out System.Runtime.InteropServices.ComTypes.IEnumFORMATETC newEnum)
     {
         newEnum = new FormatEtcEnumerator(_formats) { _index = _index };
+    }
+}
+
+sealed class ComReadOnlyStream : System.Runtime.InteropServices.ComTypes.IStream, IDisposable
+{
+    private readonly Stream _stream;
+    private readonly long _length;
+
+    public ComReadOnlyStream(Stream stream, long length)
+    {
+        _stream = stream;
+        _length = length;
+    }
+
+    ~ComReadOnlyStream()
+    {
+        Dispose();
+    }
+
+    public void Read(byte[] pv, int cb, IntPtr pcbRead)
+    {
+        var read = _stream.Read(pv, 0, cb);
+        if (pcbRead != IntPtr.Zero)
+        {
+            Marshal.WriteInt32(pcbRead, read);
+        }
+    }
+
+    public void Write(byte[] pv, int cb, IntPtr pcbWritten) =>
+        Marshal.ThrowExceptionForHR(unchecked((int)0x8003001D));
+
+    public void Seek(long dlibMove, int dwOrigin, IntPtr plibNewPosition)
+    {
+        if (!_stream.CanSeek)
+        {
+            Marshal.ThrowExceptionForHR(unchecked((int)0x8003001D));
+        }
+
+        var origin = dwOrigin switch
+        {
+            0 => SeekOrigin.Begin,
+            1 => SeekOrigin.Current,
+            2 => SeekOrigin.End,
+            _ => throw new ArgumentOutOfRangeException(nameof(dwOrigin))
+        };
+        var position = _stream.Seek(dlibMove, origin);
+        if (plibNewPosition != IntPtr.Zero)
+        {
+            Marshal.WriteInt64(plibNewPosition, position);
+        }
+    }
+
+    public void SetSize(long libNewSize) =>
+        Marshal.ThrowExceptionForHR(unchecked((int)0x8003001D));
+
+    public void CopyTo(System.Runtime.InteropServices.ComTypes.IStream pstm, long cb, IntPtr pcbRead, IntPtr pcbWritten)
+    {
+        var buffer = new byte[Defaults.ChunkSize];
+        long totalRead = 0;
+        long totalWritten = 0;
+
+        while (totalRead < cb)
+        {
+            var toRead = (int)Math.Min(buffer.Length, cb - totalRead);
+            var read = _stream.Read(buffer, 0, toRead);
+            if (read == 0)
+            {
+                break;
+            }
+
+            totalRead += read;
+            pstm.Write(buffer, read, IntPtr.Zero);
+            totalWritten += read;
+        }
+
+        if (pcbRead != IntPtr.Zero)
+        {
+            Marshal.WriteInt64(pcbRead, totalRead);
+        }
+
+        if (pcbWritten != IntPtr.Zero)
+        {
+            Marshal.WriteInt64(pcbWritten, totalWritten);
+        }
+    }
+
+    public void Commit(int grfCommitFlags)
+    {
+    }
+
+    public void Revert() =>
+        Marshal.ThrowExceptionForHR(unchecked((int)0x80030001));
+
+    public void LockRegion(long libOffset, long cb, int dwLockType) =>
+        Marshal.ThrowExceptionForHR(unchecked((int)0x80030001));
+
+    public void UnlockRegion(long libOffset, long cb, int dwLockType) =>
+        Marshal.ThrowExceptionForHR(unchecked((int)0x80030001));
+
+    public void Stat(out System.Runtime.InteropServices.ComTypes.STATSTG pstatstg, int grfStatFlag)
+    {
+        pstatstg = new System.Runtime.InteropServices.ComTypes.STATSTG
+        {
+            type = 2,
+            cbSize = _length
+        };
+    }
+
+    public void Clone(out System.Runtime.InteropServices.ComTypes.IStream ppstm)
+    {
+        ppstm = null!;
+        Marshal.ThrowExceptionForHR(unchecked((int)0x80004001));
+    }
+
+    public void Dispose()
+    {
+        _stream.Dispose();
+        GC.SuppressFinalize(this);
     }
 }
 
