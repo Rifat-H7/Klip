@@ -1,4 +1,5 @@
-﻿sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDataObject
+[ComVisible(true)]
+sealed class VirtualFileDataObject : System.Runtime.InteropServices.ComTypes.IDataObject, IShellAsyncOperation
 {
     private const int SOk = 0;
     private const int ENotImpl = unchecked((int)0x80004001);
@@ -10,6 +11,7 @@
     private const int MaxPath = 260;
     private const int FdAttributes = 0x00000004;
     private const int FdFileSize = 0x00000040;
+    private const int FdProgressUi = 0x00004000;
     private const int DropEffectCopy = 1;
 
     private static readonly short FileGroupDescriptorFormat = unchecked((short)RegisterClipboardFormat("FileGroupDescriptorW"));
@@ -17,6 +19,8 @@
     private static readonly short PreferredDropEffectFormat = unchecked((short)RegisterClipboardFormat("Preferred DropEffect"));
     private readonly IReadOnlyList<VirtualFileItem> _items;
     private readonly Func<int, Stream> _openRead;
+    private bool _asyncMode = true;
+    private bool _inOperation;
 
     public VirtualFileDataObject(IReadOnlyList<VirtualFileItem> items, Func<int, Stream> openRead)
     {
@@ -122,6 +126,31 @@
         return ENotImpl;
     }
 
+    public void SetAsyncMode(bool doOperationAsync)
+    {
+        _asyncMode = doOperationAsync;
+    }
+
+    public void GetAsyncMode(out bool isOperationAsync)
+    {
+        isOperationAsync = _asyncMode;
+    }
+
+    public void StartOperation(IntPtr bindContext)
+    {
+        _inOperation = true;
+    }
+
+    public void InOperation(out bool inAsyncOperation)
+    {
+        inAsyncOperation = _inOperation;
+    }
+
+    public void EndOperation(int result, IntPtr bindContext, uint effects)
+    {
+        _inOperation = false;
+    }
+
     private static System.Runtime.InteropServices.ComTypes.FORMATETC CreateFormatEtc(short format, int index) =>
         new()
         {
@@ -200,7 +229,7 @@
         {
             var item = _items[i];
             var descriptor = bytes.AsSpan(sizeof(uint) + (FileDescriptorSize * i), FileDescriptorSize);
-            BinaryPrimitives.WriteUInt32LittleEndian(descriptor[0..4], FdAttributes | FdFileSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(descriptor[0..4], FdAttributes | FdFileSize | FdProgressUi);
             BinaryPrimitives.WriteUInt32LittleEndian(descriptor[36..40], (uint)item.Attributes);
 
             BinaryPrimitives.WriteUInt32LittleEndian(descriptor[64..68], (uint)(item.Length >> 32));
